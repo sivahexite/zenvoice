@@ -13,12 +13,16 @@ export class PromptService {
     const apiKey = this.configService.get<string>('OPENAI_API_KEY');
 
     if (!apiKey) {
-      throw new Error('OPENAI_API_KEY is not configured in environment variables');
+      // Avoid crashing the entire application when the API key is not provided.
+      // The service will operate in a "disabled" mode and return stubbed responses.
+      this.logger.warn('OPENAI_API_KEY is not configured. Prompt generation will return stub data.');
+      // @ts-ignore – OpenAI type expects a key but we intentionally leave it undefined.
+      this.openai = undefined as unknown as OpenAI;
+    } else {
+      this.openai = new OpenAI({
+        apiKey,
+      });
     }
-
-    this.openai = new OpenAI({
-      apiKey: apiKey,
-    });
 
     this.logger.log('PromptService initialized with OpenAI client');
   }
@@ -53,17 +57,24 @@ Explain how the assistant should handle unclear input or tool/API failure.
 Return the result in a markdown-style block (with no explanations or headers).
 `;
 
-      const completion = await this.openai.chat.completions.create({
-        model: 'gpt-4',
-        messages: [
-          { role: 'system', content: 'You are a helpful assistant.' },
-          { role: 'user', content: prompt },
-        ],
-        temperature: 0.7,
-        max_tokens: 800,
-      });
+      // If OpenAI client is disabled due to missing API key, return a deterministic stub.
+      let generatedPrompt: string | undefined;
 
-      const generatedPrompt = completion.choices[0]?.message?.content;
+      if (!this.openai) {
+        generatedPrompt = `# Stub Prompt\n\nIdentity: Stub AI Assistant\n\nStyle: Friendly and helpful\n\nResponse Guidelines: Always provide a helpful answer.\n\nTask & Goals: ${taskDescription}`;
+      } else {
+        const completion = await this.openai.chat.completions.create({
+          model: 'gpt-4',
+          messages: [
+            { role: 'system', content: 'You are a helpful assistant.' },
+            { role: 'user', content: prompt },
+          ],
+          temperature: 0.7,
+          max_tokens: 800,
+        });
+
+        generatedPrompt = completion.choices[0]?.message?.content;
+      }
 
       if (!generatedPrompt) {
         throw new InternalServerErrorException('Failed to generate prompt from OpenAI');
