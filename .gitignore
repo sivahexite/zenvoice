@@ -62,3 +62,4 @@ Thumbs.db
 *.mov
 *.wmv
 
+ai_agent/venv/
