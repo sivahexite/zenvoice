@@ -279,8 +279,8 @@ You are an AI Hotel Booking Assistant.
     } catch (error) {
       console.error("🚨 Network/Parse Error:", {
         error,
-        message: error.message,
-        stack: error.stack,
+        message: (error as Error).message,
+        stack: (error as Error).stack,
         url,
         requestData,
       });

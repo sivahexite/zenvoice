@@ -119,8 +119,8 @@ class ApiClient {
         url,
         baseURL: this.baseURL,
         endpoint,
-        errorMessage: error.message,
-        errorStack: error.stack,
+        errorMessage: (error as Error).message,
+        errorStack: (error as Error).stack,
       });
 
       if (error instanceof ApiError) {
@@ -136,15 +136,15 @@ class ApiClient {
           url,
           baseURL: this.baseURL,
           timestamp: new Date().toISOString(),
-          errorType: error.name,
-          errorMessage: error.message,
+          errorType: (error as Error).name,
+          errorMessage: (error as Error).message,
         },
       );
 
       console.error("🚨 Complete network error details:", {
         error: networkError,
         originalError: error,
-        stack: error.stack,
+        stack: (error as Error).stack,
         requestDetails: { url, method: config.method, headers: config.headers },
       });
 
