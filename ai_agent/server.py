@@ -2,6 +2,8 @@ import os
 import asyncio
 import uuid
 import traceback
+import json
+from typing import List, Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query,Body
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
@@ -16,8 +18,22 @@ from bolna.agent_manager.assistant_manager import AssistantManager
 load_dotenv()
 logger = configure_logger(__name__)
 
-redis_pool = redis.ConnectionPool.from_url(os.getenv('REDIS_URL'), decode_responses=True)
-redis_client = redis.Redis.from_pool(redis_pool)
+# In-memory storage fallback
+in_memory_storage = {}
+
+# Try to connect to Redis, fallback to in-memory storage
+try:
+    redis_pool = redis.ConnectionPool.from_url(os.getenv('REDIS_URL'), decode_responses=True)
+    redis_client = redis.Redis.from_pool(redis_pool)
+    # Test the connection
+    redis_client.ping()
+    use_redis = True
+    logger.info("Connected to Redis successfully")
+except Exception as e:
+    logger.warning(f"Redis connection failed, using in-memory storage: {e}")
+    use_redis = False
+    redis_client = None
+
 active_websockets: List[WebSocket] = []
 
 app = FastAPI()
@@ -40,11 +56,15 @@ class CreateAgentPayload(BaseModel):
 async def get_agent(agent_id: str):
     """Fetches an agent's information by ID."""
     try:
-        agent_data = await redis_client.get(agent_id)
+        if use_redis:
+            agent_data = await redis_client.get(agent_id)
+        else:
+            agent_data = in_memory_storage.get(agent_id)
+            
         if not agent_data:
             raise HTTPException(status_code=404, detail="Agent not found")
 
-        return json.loads(agent_data)
+        return json.loads(agent_data) if isinstance(agent_data, str) else agent_data
 
     except Exception as e:
         logger.error(f"Error fetching agent {agent_id}: {e}", exc_info=True)
@@ -74,10 +94,15 @@ async def create_agent(agent_data: CreateAgentPayload):
                 data_for_db["tasks"][index]["tools_config"]["llm_agent"]['extraction_json'] = extraction_prompt
 
     stored_prompt_file_path = f"{agent_uuid}/conversation_details.json"
-    await asyncio.gather(
-        redis_client.set(agent_uuid, json.dumps(data_for_db)),
-        store_file(file_key=stored_prompt_file_path, file_data=agent_prompts, local=True)
-    )
+    
+    if use_redis:
+        await asyncio.gather(
+            redis_client.set(agent_uuid, json.dumps(data_for_db)),
+            store_file(file_key=stored_prompt_file_path, file_data=agent_prompts, local=True)
+        )
+    else:
+        in_memory_storage[agent_uuid] = data_for_db
+        await store_file(file_key=stored_prompt_file_path, file_data=agent_prompts, local=True)
 
     return {"agent_id": agent_uuid, "state": "created"}
 
@@ -87,11 +112,15 @@ async def edit_agent(agent_id: str, agent_data: CreateAgentPayload = Body(...)):
     """Edits an existing agent based on the provided agent_id."""
     try:
 
-        existing_data = await redis_client.get(agent_id)
+        if use_redis:
+            existing_data = await redis_client.get(agent_id)
+        else:
+            existing_data = in_memory_storage.get(agent_id)
+            
         if not existing_data:
             raise HTTPException(status_code=404, detail="Agent not found")
 
-        existing_data = json.loads(existing_data)
+        existing_data = json.loads(existing_data) if isinstance(existing_data, str) else existing_data
 
 
         new_data = agent_data.agent_config.model_dump()
@@ -121,10 +150,15 @@ async def edit_agent(agent_id: str, agent_data: CreateAgentPayload = Body(...)):
 
 
         stored_prompt_file_path = f"{agent_id}/conversation_details.json"
-        await asyncio.gather(
-            redis_client.set(agent_id, json.dumps(new_data)),
-            store_file(file_key=stored_prompt_file_path, file_data=agent_prompts, local=True)
-        )
+        
+        if use_redis:
+            await asyncio.gather(
+                redis_client.set(agent_id, json.dumps(new_data)),
+                store_file(file_key=stored_prompt_file_path, file_data=agent_prompts, local=True)
+            )
+        else:
+            in_memory_storage[agent_id] = new_data
+            await store_file(file_key=stored_prompt_file_path, file_data=agent_prompts, local=True)
 
         return {"agent_id": agent_id, "state": "updated"}
 
@@ -136,11 +170,16 @@ async def edit_agent(agent_id: str, agent_data: CreateAgentPayload = Body(...)):
 async def delete_agent(agent_id: str):
     """Deletes an agent by ID."""
     try:
-        agent_exists = await redis_client.exists(agent_id)
-        if not agent_exists:
-            raise HTTPException(status_code=404, detail="Agent not found")
-
-        await redis_client.delete(agent_id)
+        if use_redis:
+            agent_exists = await redis_client.exists(agent_id)
+            if not agent_exists:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            await redis_client.delete(agent_id)
+        else:
+            if agent_id not in in_memory_storage:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            del in_memory_storage[agent_id]
+            
         return {"agent_id": agent_id, "state": "deleted"}
 
     except Exception as e:
@@ -150,23 +189,23 @@ async def delete_agent(agent_id: str):
 
 @app.get("/all")
 async def get_all_agents():
-    """Fetches all agents stored in Redis."""
+    """Fetches all agents stored in Redis or memory."""
     try:
+        if use_redis:
+            agent_keys = await redis_client.keys("*")
+            if not agent_keys:
+                return {"agents": []}
+            agents_data = []
+            for key in agent_keys:
+                try:
+                    data = await redis_client.get(key)
+                    agents_data.append(data)
+                except Exception as e:
+                    logger.error(f"An error occurred with key {key}: {e}")
 
-        agent_keys = await redis_client.keys("*")
-
-        if not agent_keys:
-            return {"agents": []}
-        agents_data = []
-        for key in agent_keys:
-            try:
-                data = await redis_client.get(key)
-                agents_data.append(data)
-            except Exception as e:
-                logger.error(f"An error occurred with key {key}: {e}")
-
-
-        agents = [{ "agent_id": key, "data": json.loads(data) } for key, data in zip(agent_keys, agents_data) if data]
+            agents = [{ "agent_id": key, "data": json.loads(data) } for key, data in zip(agent_keys, agents_data) if data]
+        else:
+            agents = [{ "agent_id": key, "data": data } for key, data in in_memory_storage.items()]
 
         return {"agents": agents}
 
@@ -210,10 +249,18 @@ async def websocket_endpoint(agent_id: str, websocket: WebSocket, user_agent: st
     active_websockets.append(websocket)
     agent_config, context_data = None, None
     try:
-        retrieved_agent_config = await redis_client.get(agent_id)
+        if use_redis:
+            retrieved_agent_config = await redis_client.get(agent_id)
+        else:
+            retrieved_agent_config = in_memory_storage.get(agent_id)
+            
         print(f"MAIN: Retrieved agent config: {retrieved_agent_config is not None}")
         logger.info(f"MAIN: Retrieved agent config: {retrieved_agent_config}")
-        agent_config = json.loads(retrieved_agent_config)
+        
+        if not retrieved_agent_config:
+            raise HTTPException(status_code=404, detail="Agent not found")
+            
+        agent_config = json.loads(retrieved_agent_config) if isinstance(retrieved_agent_config, str) else retrieved_agent_config
     except Exception as e:
         print(f"MAIN: Error getting agent config: {e}")
         traceback.print_exc()
